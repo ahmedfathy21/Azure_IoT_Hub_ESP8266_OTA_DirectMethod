@@ -15,6 +15,9 @@
 #include <bearssl/bearssl.h>
 #include <bearssl/bearssl_hmac.h>
 #include <libb64/cdecode.h>
+#include <ArduinoJson.h>
+#include <ESP8266HTTPClient.h>
+#include <ESP8266httpUpdate.h>
 // Azure IoT SDK for C includes
 #include <az_core.h>
 #include <az_iot.h>
@@ -38,7 +41,7 @@ static const char* host = IOT_CONFIG_IOTHUB_FQDN;
 static const char* device_id = IOT_CONFIG_DEVICE_ID;
 static const char* device_key = IOT_CONFIG_DEVICE_KEY;
 static const int port = 8883;
-
+const char* CURRENT_FIRMWARE_VERSION = "v1.0.0";
 // Memory allocated for the sample's variables and structures.
 static WiFiClientSecure wifi_client;
 static X509List cert((const char*)ca_pem);
@@ -98,7 +101,22 @@ static void printCurrentTime()
   Serial.print("Current time: ");
   Serial.print(getCurrentLocalTimeString());
 }
+void sendTelemetry() {
+  StaticJsonDocument<256> doc;
+  doc["deviceId"] = device_id;
+  doc["version"] = CURRENT_FIRMWARE_VERSION;
+  
+  
+  char telemetryMsg[256];
+  serializeJson(doc, telemetryMsg);
+  
+ // Use snprintf to format the topic string properly
+char topic[128]; // Adjust size as needed
+snprintf(topic, sizeof(topic), "devices/%s/messages/events/", device_id);
 
+// Publish the message
+mqtt_client.publish(topic, telemetryMsg);
+}
 void receivedCallback(char* topic, byte* payload, unsigned int length)
 {
   // Receiving Cloud To Device Messages
@@ -120,60 +138,69 @@ void receivedCallback(char* topic, byte* payload, unsigned int length)
 }
 
 // Handle Received Method
-void directMethodCallback(char* topic, byte* payload, unsigned int length)
-{
-  char method_name[MAX_METHOD_NAME_CHARACTERSS];  // max method name is 64
-  uint8_t i = 21;
+void directMethodCallback(char* topic, byte* payload, unsigned int length) {
+  char method_name[MAX_METHOD_NAME_CHARACTERSS];
+  uint8_t i = 21; // Starting after "$iothub/methods/POST/"
   uint8_t j = 0;
-  for (; topic[i] != '/' && topic[i] != '\0' && j < sizeof(method_name) - 1; i++, j++)
-  {
+  for (; topic[i] != '/' && topic[i] != '\0' && j < sizeof(method_name) - 1; i++, j++) {
     method_name[j] = topic[i];
   }
   method_name[j] = '\0';
 
-  Serial.print("Received Direct Method Name: ");
-  Serial.println(method_name);
-
-  Serial.print("Received Direct Method Payload: ");
-  for (int i = 0; i < length; i++)
-  {
-    Serial.print((char)payload[i]);
-  }
-  Serial.println();
-
-  if (strcmp(method_name, "on") == 0) {
-    digitalWrite(LED_PIN, LOW);  // Turn the LED on
-    Serial.println("LED turned ON.");
-  } else if (strcmp(method_name, "off") == 0) {
-    digitalWrite(LED_PIN, HIGH);  // Turn the LED off
-    Serial.println("LED turned OFF.");
-  } else {
-    Serial.println("Unknown method name.");
-  }
-
   // Extract request ID ($rid)
-  char requestId[32];
-  uint8_t k = 0;
-  for (i = 0; topic[i] != '\0'; i++) {
-    if (strncmp(&topic[i], "$rid=", 5) == 0) {
-      i += 5;  // Move past "$rid="
-      while (topic[i] != '\0' && topic[i] != '&' && k < sizeof(requestId) - 1) {
-        requestId[k++] = topic[i++];
-      }
-      requestId[k] = '\0';
-      break;
+  char requestId[32] = {0};
+  char* rid_ptr = strstr(topic, "$rid=");
+  if (rid_ptr != NULL) {
+    rid_ptr += 5; // Move past "$rid="
+    int k = 0;
+    while (*rid_ptr != '&' && *rid_ptr != '\0' && k < sizeof(requestId) - 1) {
+      requestId[k++] = *rid_ptr++;
     }
+    requestId[k] = '\0';
   }
 
   char responseTopic[128];
   snprintf(responseTopic, sizeof(responseTopic), "$iothub/methods/res/200/?$rid=%s", requestId);
 
-  // Publish the response to Azure IoT Hub
-  bool responseSent = mqtt_client.publish(responseTopic, "{}");
-  if (responseSent) {
-    Serial.println("Direct method response sent successfully.");
-  } else {
-    Serial.println("Failed to send direct method response.");
+  if (strcmp(method_name, "downloadOTA") == 0) {
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, payload, length);
+    
+    if (error) {
+      mqtt_client.publish(responseTopic, "{\"error\":\"Invalid JSON payload\"}");
+      return;
+    }
+
+    const char* targetVersion = doc["version"];
+    const char* firmwareUrl = doc["firmwareUrl"];
+
+    if (!targetVersion || !firmwareUrl) {
+      mqtt_client.publish(responseTopic, "{\"error\":\"Missing required fields\"}");
+      return;
+    }
+
+    // Send immediate response with version info
+    char ackMsg[128];
+    snprintf(ackMsg, sizeof(ackMsg), 
+            "{\"status\":\"Received\",\"currentVersion\":\"%s\",\"targetVersion\":\"%s\"}",
+            CURRENT_FIRMWARE_VERSION, 
+            targetVersion);
+    mqtt_client.publish(responseTopic, ackMsg);
+    mqtt_client.loop();
+    delay(100);
+
+    // Version comparison
+    if (strcmp(targetVersion, CURRENT_FIRMWARE_VERSION) == 0) {
+      char statusTopic[128];
+      snprintf(statusTopic, sizeof(statusTopic), "devices/%s/messages/events/", device_id);
+      mqtt_client.publish(statusTopic, "{\"updateStatus\":\"Already on latest version\"}");
+      return;
+    }
+
+    // Disconnect MQTT cleanly
+    mqtt_client.disconnect();
+
+    // ... [existing OTA update code] ...
   }
 }
 
